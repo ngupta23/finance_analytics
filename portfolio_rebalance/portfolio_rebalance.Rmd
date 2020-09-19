@@ -1,0 +1,285 @@
+---
+title: "Portfolio Rebalance"
+author: "Nikhil Gupta"
+date: "`r Sys.time()`"
+always_allow_html: yes
+output:
+ html_document:
+   toc: true
+   toc_float: true
+   toc_depth: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls()) # Remove existing variables
+```
+
+# Setup
+```{r}
+library(tidyverse)
+library(ROI)
+library(ROI.plugin.glpk)
+library(ompr)
+library(ompr.roi)
+library(DT)
+```
+
+```{r}
+source("glide_path.R")
+```
+
+## Paths
+```{r}
+# Setup path to various files
+accounts_path = "../../data/n_accounts/"
+new_additions_path = "../../data/n_new_additions/n_new_additions.csv"
+age_path = "../../data/age/n.txt"
+```
+
+## Ordering of Asset Classes
+
+```{r}
+# 1 = Large Cap, 2 = Mid Cap, 3 = Small Cap, 4 = Intl - Developed, 5 = Intl - Emerging, 6 = REIT, 7 = Bond, 8 = Cash (in that order)
+asset_classes = tribble(~asset_class,
+                        "Large Cap", "Mid Cap", "Small Cap",
+                        "Intl - Developed", "Intl - Emerging",
+                        "REIT", "Bond", "Cash") %>% 
+  rowid_to_column("index")
+  
+n_classes = nrow(asset_classes) 
+```
+
+## Ordering of accounts
+```{r}
+ordered_accounts = tribble(~account,
+                   "n_401k_pretax", "n_401k_roth", "n_ira_roth", "n_brokerage", "n_hsa") %>% 
+  rowid_to_column("index")
+
+n_accounts = nrow(ordered_accounts) 
+
+ordered_accounts
+```
+
+# Read all the data
+
+## Account Information
+
+```{r}
+# Merging files: https://stackoverflow.com/questions/46299777/add-filename-column-to-table-as-multiple-files-are-read-and-bound
+# Regex: https://stackoverflow.com/questions/15073753/regex-return-file-name-remove-path-and-file-extension
+
+filenames = list.files(accounts_path, full.names = TRUE, pattern = ".csv", recursive = TRUE)
+
+account_balances = suppressMessages(tibble(File = filenames) %>% 
+  tidyr::extract(File, "account", ".*\\/([^.]+)\\.[[:alnum:]]+$", remove = FALSE) %>% 
+  mutate(Data = lapply(File, read_csv)) %>% 
+  unnest(Data) %>% 
+  select(-File))
+
+```
+
+
+## New Additions
+```{r}
+n_new_additions = read.csv(new_additions_path, stringsAsFactors = FALSE)
+```
+
+## Target Allocation (Glide Path)
+```{r}
+current_age = as.numeric(readLines(age_path)) 
+target_allocation = get_target_allocation(age = current_age)
+target_allocation
+```
+
+
+# Pre Check
+
+## All Columns Present?
+```{r}
+## TODO: Check if all the required columns are present
+```
+
+## Account Names Match
+```{r}
+## TODO: Check if the account names in the "account balance" files match with the ones specified in the "new additions" file
+```
+
+# Exploratory Analysis
+
+## Totals
+
+### By Account
+```{r}
+account_totals = account_balances %>% 
+  group_by(account) %>% 
+  summarise(current_total = sum(amount)) %>% 
+  full_join(n_new_additions, by = 'account') %>% 
+  mutate(new_total = current_total + new_addition)
+
+account_totals
+```
+
+### By Asset Class 
+```{r}
+current_total = sum(account_totals$current_total)
+new_total = sum(account_totals$new_total)
+
+asset_class_totals = account_balances %>% 
+  group_by(asset_class) %>% 
+  summarise(current_total_by_class = sum(amount),
+            current_alloc = round(current_total_by_class/current_total*100,2)) %>% 
+  full_join(target_allocation, by = 'asset_class') %>% 
+  select(-reference_alloc) %>% 
+  mutate(target_total_by_class = round(target_alloc * new_total / 100))
+
+
+asset_class_totals
+```
+
+### By Account and Asset Class
+```{r}
+account_asset_class_totals = account_balances %>% 
+  group_by(account, asset_class) %>%  
+  mutate(amount = sum(amount)) %>% 
+  ungroup()
+
+account_asset_class_totals
+```
+
+# Rebalance Rules 
+
+**The rebalance needs to be done in such a way that there is no tax that needs to be paid**. 
+
+* You can buy and sell any funds in the 401K and IRA accounts
+* You can only add money (buy) to funds in the brokerage account. Selling funds will (potentially) incur a tax if there were associated gains.
+
+**The rebalance needs to follow good _asset_location_ strategies in order to minimize after tax returns**. 
+
+* Place taxable bond funds and cash in the pretax 401k account since this will be taxed at your maximum tax bracket when withdrawing. Since these funds will likely generate less returns compared to non-cash equivalent investments, the amount that is taxable at the maximum tax rate will be minimized.
+* Dont place REIT's and taxable bonds in the brokerage account since they generate lot of taxable income every year (at your maximum tax rate, not long term capital gains). 
+* Place high gain potential investments such as stocks in the Roth 401K, Roth IRA or Brokerage Account. ROTH accounts are non taxable so we want these accounts to grow as much as possible. Brokerage accounts will get taxed at long term capital gains eventually ansd assuming this tax rate does not change appreciable, this is most likely going to be less than the marginal tax rate.   
+
+**Historic Constraints**
+
+* For simplicity, HSA account is maintained separately with a separate target allocation (this was done for historic reasons unrelated to tax)
+* I dont differentiate between Mid Cap and Small Cap so I prefer to have the same amount for both funds in an account whenever possible.
+
+
+# Setup Optimization Problem
+
+## Set Constraint Values
+
+```{r}
+#### Account Totals
+accounts_ub = account_totals %>% 
+  arrange(match(account, ordered_accounts$account)) %>%
+  select(new_total) %>% pluck(1)
+
+#### Asset Class Totals
+asset_class_new_totals = asset_class_totals %>% 
+  arrange(match(asset_class, asset_classes$asset_class)) %>%
+  select(target_total_by_class) %>% pluck(1)
+  
+#### Brokerage Lower Bound
+lb_brokerage = account_asset_class_totals %>% 
+  filter(account == 'n_brokerage', asset_class %in% asset_classes$asset_class) %>% 
+  select(amount) %>% pluck(1)
+
+#### HSA New Values
+hsa_target_alloc = c(0.595, 0, 0, 0.195, 0, 0, 0.21, 0)
+hsa_targets = round(accounts_ub[5] * hsa_target_alloc)
+```
+
+
+## Optimize
+
+```{r}
+model = MIPModel() %>%
+  
+  #### 1.0 Variables
+  add_variable(accounts[i,j], i = 1:n_accounts, j = 1:n_classes, type = "continuous", lb = 0) %>% 
+  
+  #### 2.0 Constraints
+  
+  ## ## 2.1 Asset Location and Unavailability Constraints
+  # Pretax 401K
+  ## Intl - Emerging (Unavailable in account)
+  ## REIT (Unavailable in account & Asset Location Constraints)
+  add_constraint(accounts[1,j] == 0, j = 5:6) %>%
+  
+  # ROTH 401K
+  ## Intl - Emerging and REIT (Unavailable in account)
+  ## Bond and Cash (Asset Location Constraints)
+  add_constraint(accounts[2,j] == 0, j = 5:8) %>%
+  
+  # ROTH IRA
+  ## Intl - Emerging (Unavailable in account)
+  ## Bond and Cash (Asset Location Constraints)
+  add_constraint(accounts[3,j] == 0, j = c(5, 7:8)) %>%
+  
+  # Brokerage
+  ## REIT, Bond and Cash (Asset Location Constraints)
+  add_constraint(accounts[4,j] == 0, j = 6:8) %>%
+  
+  ## 2.2 Tax Constraints
+  add_constraint(accounts[4,j] >= lb_brokerage[j], j = 1:n_classes) %>% ## Dont sell any assets in Brokerage
+  
+  ## 2.3 Historic Consraints
+  add_constraint(accounts[i,2] == accounts[i,3], i = 1:n_accounts) %>% ## Mid Cap Amount = Small Cap Amount (all accounts)
+  add_constraint(accounts[5,j] == hsa_targets[j], j = 1:n_classes) %>% ## Managing HSA allocation separately
+  
+  ## 2.4 Individual Account Totals must match
+  add_constraint(sum_expr(accounts[i,j], j = 1:n_classes) == accounts_ub[i], i = 1:n_accounts) %>% 
+  
+  ## 2.5 Asset Class Totals must match
+  add_constraint(sum_expr(accounts[i,j], i = 1:n_accounts) == asset_class_new_totals[j], j = 1:n_classes) %>% 
+  
+  #### 3.0 Solve
+  solve_model(with_ROI(solver = 'glpk', verbose = TRUE))
+ 
+```
+
+```{r}
+model
+
+if(model$status != "optimal"){
+  stop("Optimizer could not compute the new asset allocation. It is possible that no solution exists, but it is also possible that the constraints are not correct. Please add one constraint at a time to check if any constraint is breaking the optimizer.")
+}
+```
+
+
+```{r}
+
+final_allocation = get_solution(model, accounts[i,j]) %>% 
+  ## Convert to human readable table
+  spread(i, value) %>% 
+  
+  # Convert Asset Class indices to human readable values
+  full_join(asset_classes, by = c('j' = 'index')) %>% 
+  column_to_rownames(var = 'asset_class') %>%
+  
+  # Remove unnecessary variables
+  select(-c(variable,j)) %>% 
+  
+  # Convert Account indices to human readable values
+  setNames(ordered_accounts$account)
+  
+  
+DT::datatable(final_allocation)
+
+```
+
+
+
+# Next Steps
+
+* See if the account type (pre-tax, ROTH, Brokerage, etc.) can be automatically taken care of along with its constraints 
+
+```{r}
+
+```
+
